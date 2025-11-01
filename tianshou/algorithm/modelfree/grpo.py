@@ -2,13 +2,47 @@ import hashlib
 
 import numpy as np
 import torch
-
+from typing import cast
 from tianshou.algorithm.algorithm_base import OnPolicyAlgorithm, TrainingStats
 from tianshou.algorithm.modelfree.reinforce import ProbabilisticActorPolicy
 from tianshou.algorithm.optim import OptimizerFactory
 from tianshou.data import ReplayBuffer
-from tianshou.data.types import RolloutBatchProtocol
+from tianshou.data.types import RolloutBatchProtocol, TrajectoryBatchProtocol
 
+
+def get_unique_initial_states(batch: TrajectoryBatchProtocol) -> dict[str, np.ndarray]:
+    """Get mapping from state hash to actual state array."""
+    first_occurrence_mask = np.concatenate([[True], batch.trajectory_id[1:] != batch.trajectory_id[:-1]])
+    first_timesteps = batch[first_occurrence_mask]
+
+    unique_states = {}
+    for state in first_timesteps.initial_state:
+        state_hash = numpy_hash_rounded(state)
+        if state_hash not in unique_states:
+            unique_states[state_hash] = state
+
+    return unique_states
+
+
+def filter_by_initial_state(
+        batch: TrajectoryBatchProtocol,
+        state_hash: str,
+) -> TrajectoryBatchProtocol:
+    """Filter batch to only include timesteps from trajectories with given initial state."""
+    # Find all trajectory IDs that match this initial state
+    first_occurrence_mask = np.concatenate([[True], batch.trajectory_id[1:] != batch.trajectory_id[:-1]])
+    first_timesteps_per_traj = batch[first_occurrence_mask]
+
+    # Hash the initial states and find matching trajectory IDs
+    matching_traj_ids = []
+    for i, traj_id in enumerate(first_timesteps_per_traj.trajectory_id):
+        state = first_timesteps_per_traj.initial_state[i]
+        if numpy_hash_rounded(state) == state_hash:
+            matching_traj_ids.append(traj_id)
+
+    # Filter batch to only include these trajectory IDs
+    mask = np.isin(batch.trajectory_id, matching_traj_ids)
+    return cast(TrajectoryBatchProtocol, batch[mask])
 
 
 def numpy_hash_rounded(arr: np.ndarray, decimals: int = 6, algorithm='sha1') -> str:
@@ -71,124 +105,64 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
 
         return trajectory_returns
 
-    def _group_trajectories_by_starting_state(
-            self,
-            starting_states: np.ndarray,
-            start_indices: np.ndarray,
-            end_indices: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Group trajectories by their starting state using hashing.
-
-        Returns:
-            unique_hashes: Array of unique state hashes
-            inverse_indices: Mapping from trajectory index to unique hash index
-        """
-        # Compute hashes for all starting states
-        state_hashes = np.array([numpy_hash_rounded(state) for state in starting_states])
-
-        # Group episodes by unique starting state hash
-        unique_hashes, inverse_indices = np.unique(state_hashes, return_inverse=True)
-
-        return unique_hashes, inverse_indices
-
-    def _compute_and_assign_advantages_per_state(
-            self,
-            batch: RolloutBatchProtocol,
-            unique_hashes: np.ndarray,
-            inverse_indices: np.ndarray,
-            starting_states: np.ndarray,
-            start_indices: np.ndarray,
-            end_indices: np.ndarray,
-            trajectory_returns: np.ndarray
-    ) -> None:
-        """For each unique starting state, compute standardized advantages and assign to batch.
-
-        This method:
-        1. Groups trajectories by starting state
-        2. Computes mean and std of returns for each group
-        3. Calculates standardized advantages: (return - mean) / std
-        4. Assigns the advantage to all timesteps in each trajectory
-        """
-        # Initialize advantage array in batch
-        batch.adv = np.zeros(len(batch), dtype=np.float64)
-        batch.starting_states = {}
-
-        for i, unique_hash in enumerate(unique_hashes):
-            # Find all trajectories with this starting state
-            mask = inverse_indices == i
-            trajectory_indices_in_group = np.where(mask)[0]
-
-            # Get returns for this group of trajectories
-            group_returns = trajectory_returns[mask]
-
-            # Compute mean and std for this starting state group
-            mean_return = group_returns.mean()
-            std_return = group_returns.std()
-
-            # Avoid division by zero
-            if std_return < 1e-8:
-                std_return = 1e-8
-
-            # Compute standardized advantages (return - mean) / std
-            standardized_advantages = (group_returns - mean_return) / std_return
-
-            # Assign advantages to all timesteps in each trajectory
-            episode_indices_list = []
-            for traj_idx, advantage in zip(trajectory_indices_in_group, standardized_advantages):
-                start_idx = start_indices[traj_idx]
-                end_idx = end_indices[traj_idx]
-
-                # Assign the same advantage to all timesteps in this trajectory
-                batch.adv[start_idx:end_idx + 1] = advantage
-
-                episode_indices_list.append((start_idx, end_idx))
-
-            # Store metadata for this starting state group
-            first_traj_idx = trajectory_indices_in_group[0]
-            batch.starting_states[unique_hash] = {
-                "state": starting_states[first_traj_idx],
-                "indices": episode_indices_list,
-                "returns": group_returns,
-                "mean_return": mean_return,
-                "std_return": std_return,
-                "standardized_advantages": standardized_advantages
-            }
-
     def _preprocess_batch(
             self,
             batch: RolloutBatchProtocol,
             buffer: ReplayBuffer,
             indices: np.ndarray,
-    ) -> RolloutBatchProtocol:
-        """Preprocess batch by computing advantages using GRPO algorithm.
+    ) -> TrajectoryBatchProtocol:
+        """Preprocess batch by computing advantages using GRPO algorithm."""
 
-        GRPO groups trajectories by their starting state, computes the mean and std
-        of returns within each group, and assigns standardized advantages to each trajectory.
-        """
         # Step 1: Extract episode boundaries
         start_indices, end_indices = self._extract_episode_boundaries(batch)
+        num_episodes = len(start_indices)
+        last_done_idx = end_indices[-1]
+        batch = batch[:last_done_idx + 1]
 
-        # Step 2: Extract starting states for all episodes
-        starting_states = batch[start_indices].obs
+        # Step 2: Pre-allocate metadata arrays (compute once)
+        batch.trajectory_id = np.zeros(len(batch), dtype=np.int64)
+        batch.initial_state = np.empty((len(batch),) + batch.obs.shape[1:], dtype=batch.obs.dtype)
+        batch.adv = np.zeros(len(batch), dtype=np.float64)
 
-        # Step 3: Compute total return for each trajectory
+        # Step 3: Extract starting states and compute hashes ONCE
+        starting_states = np.round(batch[start_indices].obs, decimals=6)
+        state_hashes = np.array([numpy_hash_rounded(state) for state in starting_states])
+        unique_hashes, inverse_indices = np.unique(state_hashes, return_inverse=True)
+
+        # Step 4: Compute trajectory returns
         trajectory_returns = self._compute_trajectory_returns(batch, start_indices, end_indices)
 
-        # Step 4: Group trajectories by starting state
-        unique_hashes, inverse_indices = self._group_trajectories_by_starting_state(
-            starting_states, start_indices, end_indices
-        )
+        # Step 5: Fill metadata arrays by trajectory
+        for traj_idx in range(num_episodes):
+            start_idx = start_indices[traj_idx]
+            end_idx = end_indices[traj_idx]
+            initial_state = starting_states[traj_idx]
 
-        # Step 5: Compute and assign advantages for each starting state group
-        self._compute_and_assign_advantages_per_state(
-            batch,
-            unique_hashes,
-            inverse_indices,
-            starting_states,
-            start_indices,
-            end_indices,
-            trajectory_returns
-        )
+            # Fill in-place by index range (like A2C does)
+            batch.trajectory_id[start_idx:end_idx + 1] = traj_idx
+            batch.initial_state[start_idx:end_idx + 1] = initial_state
+
+        # Step 6: Compute advantages per starting state group
+        for i, unique_hash in enumerate(unique_hashes):
+            mask = inverse_indices == i
+            group_returns = trajectory_returns[mask]
+
+            mean_return = group_returns.mean()
+            std_return = max(group_returns.std(), 1e-8)
+            standardized_advantages = (group_returns - mean_return) / std_return
+
+            # Assign advantages to all timesteps in each trajectory of this group
+            for traj_idx, advantage in zip(np.where(mask)[0], standardized_advantages):
+                start_idx = start_indices[traj_idx]
+                end_idx = end_indices[traj_idx]
+                batch.adv[start_idx:end_idx + 1] = advantage
+
+        # Compute logp_old
+        # Ensure actions are torch tensors
+        if isinstance(batch.act, np.ndarray):
+            batch.act = torch.from_numpy(batch.act)
+        if isinstance(batch.adv, np.ndarray):
+            batch.adv = torch.from_numpy(batch.adv)
 
         logp_old = []
         with torch.no_grad():
@@ -199,59 +173,46 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
         return batch
 
     def _update_with_batch(
-        self,
-        batch: RolloutBatchProtocol,
-        batch_size: int | None, repeat: int
+            self,
+            batch: TrajectoryBatchProtocol,
+            batch_size: int | None,
+            repeat: int,
     ) -> TrainingStats:
-        """Update policy weights by processing trajectories grouped by initial state.
-
-        For each unique initial state:
-        1. Collect ALL trajectories that started from that state into a single batch
-        2. Split that batch into minibatches
-        3. Process each minibatch and update weights
-        4. Move to the next initial state and repeat
-
-        This ensures we fully process all trajectories from one initial state before
-        moving to the next, as required by the GRPO algorithm.
-        """
+        """Update policy by iterating over initial states."""
         losses, clip_losses, kl_losses = [], [], []
         gradient_steps = 0
         split_batch_size = batch_size or self.max_batchsize
 
-        # Iterate through each unique initial state
-        for state_hash, state_info in batch.starting_states.items():
-            # Step 1: Get ALL trajectories for this initial state
-            # state_info['indices'] contains list of (start_idx, end_idx) for each trajectory
-            all_indices_for_this_state = []
-            for start_idx, end_idx in state_info['indices']:
-                # Collect all timestep indices for this trajectory (inclusive)
-                trajectory_indices = list(range(start_idx, end_idx + 1))
-                all_indices_for_this_state.extend(trajectory_indices)
+        # Get unique initial states
+        unique_states = get_unique_initial_states(batch)
 
-            # Create a batch containing all trajectories from this initial state
-            state_batch = batch[all_indices_for_this_state]
+        # Iterate over each unique initial state
+        for state_hash in unique_states.keys():
+            # Filter to get all timesteps from trajectories with this initial state
+            state_batch = filter_by_initial_state(batch, state_hash)
 
-            # Step 2: Split the state batch into minibatches
-            # Step 3: Process each minibatch and update weights
+            # Split and process minibatches
             for minibatch in state_batch.split(split_batch_size, shuffle=False, merge_last=True):
                 gradient_steps += 1
 
-                # Calculate loss for actor (sum over all trajectories in minibatch)
                 advantages = minibatch.adv
                 dist = self.policy(minibatch).dist
                 ratios = (dist.log_prob(minibatch.act) - minibatch.logp_old).exp().float()
                 clipped_ratio = torch.clamp(ratios, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
-                trajectory_policy_loss = -torch.min(ratios * advantages, clipped_ratio * advantages).mean()
+
+                trajectory_policy_loss = -torch.min(
+                    ratios * advantages,
+                    clipped_ratio * advantages
+                ).mean()
+
                 inv_ratio = 1.0 / ratios
                 trajectory_kl_penalty = torch.mean(inv_ratio - torch.log(inv_ratio + 1e-8) - 1)
 
                 loss = trajectory_policy_loss + self.kl_coefficient * trajectory_kl_penalty
-                self.optim.step(loss)
+                self.optimizer.step(loss)
+
                 losses.append(loss.item())
                 clip_losses.append(trajectory_policy_loss.item())
                 kl_losses.append(trajectory_kl_penalty.item())
-
-            # Step 4: All minibatches for this initial state have been processed
-            # Weights have been updated, now move to next initial state
 
         return TrainingStats()

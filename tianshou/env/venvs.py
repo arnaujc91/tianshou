@@ -1,5 +1,6 @@
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar, Generic, Union
 
 import gymnasium as gym
 import numpy as np
@@ -20,6 +21,62 @@ GYM_RESERVED_KEYS = [
     "action_space",
     "observation_space",
 ]
+
+ObsType = TypeVar("ObsType")
+ActType = TypeVar("ActType")
+StateType = TypeVar("StateType")
+
+class StateSettableEnv(gym.Env[ObsType, ActType], Generic[ObsType, ActType, StateType], ABC):
+    @abstractmethod
+    def set_state(self, state: StateType) -> None:
+        pass
+
+
+class CartPoleForGRPO(CartPoleEnv, StateSettableEnv[np.ndarray, Union[int, np.ndarray], np.ndarray]):
+    def __init__(self, initial_state: np.ndarray, **kwargs):
+        super().__init__(**kwargs)
+
+        if initial_state.shape != (4,):
+            raise ValueError(f"Initial state must have shape (4,), got {initial_state.shape}")
+        self._initial_state = initial_state.copy()
+
+    def reset(
+            self,
+            *,
+            seed: int | None = None,
+            options: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Reset to the stored initial state or random state."""
+        super().reset(seed=seed)
+
+        # If initial state was provided, always reset to it
+        if self._initial_state is not None:
+            self.set_state(self._initial_state)
+            return self.state.copy(), {}
+
+        # Otherwise use CartPole's default random reset
+        return super().reset(seed=seed, options=options)
+
+    def set_state(self, state: np.ndarray) -> None:
+        """Set the CartPole state [x, x_dot, theta, theta_dot]."""
+        if state.shape != (4,):
+            raise ValueError(f"State must have shape (4,), got {state.shape}")
+
+        self.state = state.copy()  # noqa: PyAttributeOutsideInit
+        self.steps_beyond_terminated = None  # noqa: PyAttributeOutsideInit
+
+        if self.render_mode == "human":
+            self.render()
+
+    def get_initial_state(self) -> np.ndarray:
+        """Get the initial CartPole state."""
+        return self._initial_state.copy()
+
+    def get_state(self) -> np.ndarray:
+        """Get the current CartPole state."""
+        return self.state.copy()
+
+EnvType = TypeVar("EnvType", bound=ENV_TYPE)
 
 
 class BaseVectorEnv:
@@ -75,8 +132,8 @@ class BaseVectorEnv:
 
     def __init__(
         self,
-        env_fns: Sequence[Callable[[], ENV_TYPE]],
-        worker_fn: Callable[[Callable[[], ENV_TYPE]], EnvWorker],
+        env_fns: Sequence[Callable[[], EnvType]],
+        worker_fn: Callable[[Callable[[], EnvType]], EnvWorker],
         wait_num: int | None = None,
         timeout: float | None = None,
     ) -> None:
@@ -107,6 +164,9 @@ class BaseVectorEnv:
         # all environments are ready in the beginning
         self.ready_id = list(range(self.env_num))
         self.is_closed = False
+
+    # def assert_env_method_exists(self, method_name: str):
+    #     self.worker.assert_method_exists(method_name)
 
     def _assert_is_not_closed(self) -> None:
         assert not self.is_closed, (
@@ -174,6 +234,21 @@ class BaseVectorEnv:
             self._assert_id(id)
         for j in id:
             self.workers[j].set_env_attr(key, value)
+
+    # def call_env_method(
+    #         self,
+    #         method_name: str,
+    #         id: int | list[int] | np.ndarray | None = None,
+    #         **kwargs,
+    # ) -> list[Any]:
+    #     self._assert_is_not_closed()
+    #     id = self._wrap_id(id)
+    #     if self.is_async:
+    #         self._assert_id(id)
+    #     results = []
+    #     for j in id:
+    #         results.append(self.workers[j].call_env_method(method_name, **kwargs))
+    #     return results
 
     def _wrap_id(
         self,
