@@ -4,7 +4,7 @@ from typing import Any, Literal
 import gymnasium as gym
 import numpy as np
 import torch
-
+from gymnasium.envs.classic_control import CartPoleEnv
 from tianshou.env.utils import ENV_TYPE, gym_new_venv_step_type
 from tianshou.env.worker import (
     DummyEnvWorker,
