@@ -1,11 +1,10 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from typing import Any, Literal, TypeVar, Generic, Union
+from typing import Any, Literal, TypeVar, Generic, Optional
 
 import gymnasium as gym
 import numpy as np
 import torch
-from gymnasium.envs.classic_control import CartPoleEnv
 from tianshou.env.utils import ENV_TYPE, gym_new_venv_step_type
 from tianshou.env.worker import (
     DummyEnvWorker,
@@ -26,55 +25,114 @@ ObsType = TypeVar("ObsType")
 ActType = TypeVar("ActType")
 StateType = TypeVar("StateType")
 
+
 class StateSettableEnv(gym.Env[ObsType, ActType], Generic[ObsType, ActType, StateType], ABC):
+    """Abstract base class for environments that support state manipulation."""
+
     @abstractmethod
     def set_state(self, state: StateType) -> None:
         pass
 
+    @abstractmethod
+    def get_state(self) -> StateType:
+        pass
 
-class CartPoleForGRPO(CartPoleEnv, StateSettableEnv[np.ndarray, Union[int, np.ndarray], np.ndarray]):
-    def __init__(self, initial_state: np.ndarray, **kwargs):
-        super().__init__(**kwargs)
+    @abstractmethod
+    def get_initial_state(self) -> StateType:
+        pass
 
-        if initial_state.shape != (4,):
-            raise ValueError(f"Initial state must have shape (4,), got {initial_state.shape}")
-        self._initial_state = initial_state.copy()
+
+class StateSettableWrapper(
+    gym.Wrapper[ObsType, ActType, ObsType, ActType],
+    StateSettableEnv[ObsType, ActType, StateType],
+    Generic[ObsType, ActType, StateType],
+):
+    """A wrapper that adds state-setting capabilities to any Gymnasium environment.
+
+    This wrapper allows you to:
+    - Set and get the internal state of an environment
+    - Reset to a specific initial state consistently
+    - Query the initial state
+
+    Args:
+        env: The environment to wrap
+        initial_state: The initial state to reset to
+        state_attr: Name of the state attribute in the wrapped environment (default: "state")
+        state_getter: Custom function to get state from environment
+        state_setter: Custom function to set state on environment
+        reset_attrs: List of attribute names to reset to None when setting state
+    """
+
+    def __init__(
+        self,
+        env: gym.Env[ObsType, ActType],
+        initial_state: StateType,
+        state_attr: str = "state",
+        state_getter: Optional[Callable[[gym.Env], StateType]] = None,
+        state_setter: Optional[Callable[[gym.Env, StateType], None]] = None,
+        reset_attrs: Optional[list[str]] = None,
+    ):
+        super().__init__(env)
+
+        self._initial_state: StateType = (
+            initial_state.copy() if hasattr(initial_state, "copy") else initial_state
+        )
+        self._state_attr = state_attr
+        self._state_getter = state_getter or (lambda e: getattr(e, state_attr))
+        self._state_setter = state_setter or (lambda e, s: setattr(e, state_attr, s))
+        self._reset_attrs = reset_attrs or ["steps_beyond_terminated", "last_u"]
 
     def reset(
-            self,
-            *,
-            seed: int | None = None,
-            options: dict[str, Any] | None = None,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
-        """Reset to the stored initial state or random state."""
-        super().reset(seed=seed)
+        self,
+        *,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[ObsType, dict[str, Any]]:
+        """Reset to the stored initial state."""
+        # First call parent reset to initialize the environment properly
+        _, info = super().reset(seed=seed)
 
-        # If initial state was provided, always reset to it
-        if self._initial_state is not None:
-            self.set_state(self._initial_state)
-            return self.state.copy(), {}
+        # Set the initial state
+        self.set_state(self._initial_state)
 
-        # Otherwise use CartPole's default random reset
-        return super().reset(seed=seed, options=options)
+        # CRITICAL: Return the OBSERVATION, not the state.
+        # We get this by calling the internal _get_obs() method.
+        obs_new: ObsType
+        if hasattr(self.env.unwrapped, "_get_obs"):
+            obs_new = self.env.unwrapped._get_obs()
+        else:
+            # Fallback for simple envs (like CartPole)
+            # where state == observation
+            obs_new = self.get_state()  # type: ignore
 
-    def set_state(self, state: np.ndarray) -> None:
-        """Set the CartPole state [x, x_dot, theta, theta_dot]."""
-        if state.shape != (4,):
-            raise ValueError(f"State must have shape (4,), got {state.shape}")
+        return obs_new, info
 
-        self.state = state.copy()  # noqa: PyAttributeOutsideInit
-        self.steps_beyond_terminated = None  # noqa: PyAttributeOutsideInit
+    def set_state(self, state: StateType) -> None:
+        """Set the environment state."""
+        state_copy: StateType = state.copy() if hasattr(state, "copy") else state
+        self._state_setter(self.env, state_copy)
+
+        # Reset environment-specific attributes
+        for attr in self._reset_attrs:
+            if hasattr(self.env, attr):
+                setattr(self.env, attr, None)
 
         if self.render_mode == "human":
             self.render()
 
-    def get_initial_state(self) -> np.ndarray:
-        """Get the initial CartPole state."""
-        return self._initial_state.copy()
+    def get_initial_state(self) -> StateType:
+        """Get the initial state."""
+        return (
+            self._initial_state.copy()
+            if hasattr(self._initial_state, "copy")
+            else self._initial_state
+        )
 
-    def get_state(self) -> np.ndarray:
-        """Get the current CartPole state."""
-        return self.state.copy()
+    def get_state(self) -> StateType:
+        """Get the current state."""
+        current_state = self._state_getter(self.env)
+        return current_state.copy() if hasattr(current_state, "copy") else current_state
+
 
 EnvType = TypeVar("EnvType", bound=ENV_TYPE)
 

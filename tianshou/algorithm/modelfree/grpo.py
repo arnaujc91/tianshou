@@ -1,4 +1,5 @@
 import hashlib
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -6,13 +7,25 @@ from typing import cast
 from tianshou.algorithm.algorithm_base import OnPolicyAlgorithm, TrainingStats
 from tianshou.algorithm.modelfree.reinforce import ProbabilisticActorPolicy
 from tianshou.algorithm.optim import OptimizerFactory
-from tianshou.data import ReplayBuffer
+from tianshou.data import ReplayBuffer, SequenceSummaryStats
 from tianshou.data.types import RolloutBatchProtocol, TrajectoryBatchProtocol
+
+
+@dataclass(kw_only=True)
+class GRPOTrainingStats(TrainingStats):
+    """Training statistics for GRPO algorithm."""
+
+    loss: SequenceSummaryStats
+    clip_loss: SequenceSummaryStats
+    kl_loss: SequenceSummaryStats
+    gradient_steps: int
 
 
 def get_unique_initial_states(batch: TrajectoryBatchProtocol) -> dict[str, np.ndarray]:
     """Get mapping from state hash to actual state array."""
-    first_occurrence_mask = np.concatenate([[True], batch.trajectory_id[1:] != batch.trajectory_id[:-1]])
+    first_occurrence_mask = np.concatenate(
+        [[True], batch.trajectory_id[1:] != batch.trajectory_id[:-1]]
+    )
     first_timesteps = batch[first_occurrence_mask]
 
     unique_states = {}
@@ -25,12 +38,14 @@ def get_unique_initial_states(batch: TrajectoryBatchProtocol) -> dict[str, np.nd
 
 
 def filter_by_initial_state(
-        batch: TrajectoryBatchProtocol,
-        state_hash: str,
+    batch: TrajectoryBatchProtocol,
+    state_hash: str,
 ) -> TrajectoryBatchProtocol:
     """Filter batch to only include timesteps from trajectories with given initial state."""
     # Find all trajectory IDs that match this initial state
-    first_occurrence_mask = np.concatenate([[True], batch.trajectory_id[1:] != batch.trajectory_id[:-1]])
+    first_occurrence_mask = np.concatenate(
+        [[True], batch.trajectory_id[1:] != batch.trajectory_id[:-1]]
+    )
     first_timesteps_per_traj = batch[first_occurrence_mask]
 
     # Hash the initial states and find matching trajectory IDs
@@ -45,25 +60,26 @@ def filter_by_initial_state(
     return cast(TrajectoryBatchProtocol, batch[mask])
 
 
-def numpy_hash_rounded(arr: np.ndarray, decimals: int = 6, algorithm='sha1') -> str:
+def numpy_hash_rounded(arr: np.ndarray, decimals: int = 6, algorithm="sha1") -> str:
     """Hash numpy array with rounding to handle floating-point precision."""
     h = hashlib.new(algorithm)
     # Round to specified decimals before hashing
     rounded = np.round(arr, decimals=decimals)
-    h.update(rounded.tobytes(order='C'))
+    h.update(rounded.tobytes(order="C"))
     h.update(arr.dtype.str.encode())
     h.update(str(arr.shape).encode())
     return h.hexdigest()
 
+
 class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
     def __init__(
-            self,
-            policy: ProbabilisticActorPolicy,
-            optim: OptimizerFactory,
-            max_batchsize: int = 256,
-            clip_epsilon=0.2,
-            kl_coefficient=0.1,
-            n_epochs=20,
+        self,
+        policy: ProbabilisticActorPolicy,
+        optim: OptimizerFactory,
+        max_batchsize: int = 256,
+        clip_epsilon=0.2,
+        kl_coefficient=0.1,
+        n_epochs=20,
     ):
         super().__init__(policy=policy)
         self.optimizer = self._create_optimizer(self.policy, optim)
@@ -72,7 +88,9 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
         self.max_batchsize = max_batchsize
         self.kl_coefficient = kl_coefficient
 
-    def _extract_episode_boundaries(self, batch: RolloutBatchProtocol) -> tuple[np.ndarray, np.ndarray]:
+    def _extract_episode_boundaries(
+        self, batch: RolloutBatchProtocol
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Extract start and end indices for each episode in the batch.
 
         Returns:
@@ -84,10 +102,7 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
         return start_indices, end_indices
 
     def _compute_trajectory_returns(
-            self,
-            batch: RolloutBatchProtocol,
-            start_indices: np.ndarray,
-            end_indices: np.ndarray
+        self, batch: RolloutBatchProtocol, start_indices: np.ndarray, end_indices: np.ndarray
     ) -> np.ndarray:
         """Compute total return for each trajectory.
 
@@ -101,15 +116,15 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
             start_idx = start_indices[i]
             end_idx = end_indices[i]
             # Sum rewards from start to end (inclusive)
-            trajectory_returns[i] = batch.rew[start_idx:end_idx + 1].sum()
+            trajectory_returns[i] = batch.rew[start_idx : end_idx + 1].sum()
 
         return trajectory_returns
 
     def _preprocess_batch(
-            self,
-            batch: RolloutBatchProtocol,
-            buffer: ReplayBuffer,
-            indices: np.ndarray,
+        self,
+        batch: RolloutBatchProtocol,
+        buffer: ReplayBuffer,
+        indices: np.ndarray,
     ) -> TrajectoryBatchProtocol:
         """Preprocess batch by computing advantages using GRPO algorithm."""
 
@@ -117,7 +132,10 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
         start_indices, end_indices = self._extract_episode_boundaries(batch)
         num_episodes = len(start_indices)
         last_done_idx = end_indices[-1]
-        batch = batch[:last_done_idx + 1]
+
+        # Dump last trajectory if incomplete
+        if last_done_idx < len(batch) - 1:
+            batch = batch[: last_done_idx + 1]
 
         # Step 2: Pre-allocate metadata arrays (compute once)
         batch.trajectory_id = np.zeros(len(batch), dtype=np.int64)
@@ -139,8 +157,8 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
             initial_state = starting_states[traj_idx]
 
             # Fill in-place by index range (like A2C does)
-            batch.trajectory_id[start_idx:end_idx + 1] = traj_idx
-            batch.initial_state[start_idx:end_idx + 1] = initial_state
+            batch.trajectory_id[start_idx : end_idx + 1] = traj_idx
+            batch.initial_state[start_idx : end_idx + 1] = initial_state
 
         # Step 6: Compute advantages per starting state group
         for i, unique_hash in enumerate(unique_hashes):
@@ -155,7 +173,7 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
             for traj_idx, advantage in zip(np.where(mask)[0], standardized_advantages):
                 start_idx = start_indices[traj_idx]
                 end_idx = end_indices[traj_idx]
-                batch.adv[start_idx:end_idx + 1] = advantage
+                batch.adv[start_idx : end_idx + 1] = advantage
 
         # Compute logp_old
         # Ensure actions are torch tensors
@@ -173,10 +191,10 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
         return batch
 
     def _update_with_batch(
-            self,
-            batch: TrajectoryBatchProtocol,
-            batch_size: int | None,
-            repeat: int,
+        self,
+        batch: TrajectoryBatchProtocol,
+        batch_size: int | None,
+        repeat: int,
     ) -> TrainingStats:
         """Update policy by iterating over initial states."""
         losses, clip_losses, kl_losses = [], [], []
@@ -201,8 +219,7 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
                 clipped_ratio = torch.clamp(ratios, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
 
                 trajectory_policy_loss = -torch.min(
-                    ratios * advantages,
-                    clipped_ratio * advantages
+                    ratios * advantages, clipped_ratio * advantages
                 ).mean()
 
                 inv_ratio = 1.0 / ratios
@@ -215,4 +232,13 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
                 clip_losses.append(trajectory_policy_loss.item())
                 kl_losses.append(trajectory_kl_penalty.item())
 
-        return TrainingStats()
+        loss_summary_stat = SequenceSummaryStats.from_sequence(losses)
+        clip_losses_summary_stat = SequenceSummaryStats.from_sequence(clip_losses)
+        kl_losses_summary_stat = SequenceSummaryStats.from_sequence(kl_losses)
+
+        return GRPOTrainingStats(
+            loss=loss_summary_stat,
+            kl_loss=kl_losses_summary_stat,
+            clip_loss=clip_losses_summary_stat,
+            gradient_steps=gradient_steps,
+        )
