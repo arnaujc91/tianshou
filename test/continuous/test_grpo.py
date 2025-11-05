@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import Optional, Any, TypeVar, Type
+from typing import TypeVar
 from test.determinism_test import AlgorithmDeterminismTest
 
 import gymnasium as gym
@@ -89,7 +89,7 @@ def get_args() -> argparse.Namespace:
     )
     # ppo special
     parser.add_argument("--vf_coef", type=float, default=0.25)
-    parser.add_argument("--ent_coef", type=float, default=0.0)
+    parser.add_argument("--ent_coef", type=float, default=0.2)
     parser.add_argument("--eps_clip", type=float, default=0.2)
     parser.add_argument("--max_grad_norm", type=float, default=0.5)
     parser.add_argument("--gae_lambda", type=float, default=0.95)

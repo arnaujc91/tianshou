@@ -10,10 +10,12 @@ TObs = TObsArr | BatchProtocol
 
 TNestedDictValue = np.ndarray | dict[str, "TNestedDictValue"]
 
-class TrajectoryBatchProtocol(BatchProtocol, Protocol):
+
+class GrpoBatchProtocol(BatchProtocol, Protocol):
     """Batch with trajectory tracking for GRPO."""
+
     initial_state: np.ndarray  # Starting state for each timestep
-    trajectory_id: np.ndarray  # Unique ID for each trajectory given the initial state
+    episode_id: np.ndarray  # Unique ID for each trajectory given the initial state
     state_hash: np.ndarray
     adv: np.ndarray  # Advantages computed by GRPO
     logp_old: torch.Tensor
