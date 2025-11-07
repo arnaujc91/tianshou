@@ -15,7 +15,7 @@ from tianshou.algorithm.modelfree.reinforce import ProbabilisticActorPolicy
 from tianshou.algorithm.optim import AdamOptimizerFactory
 from tianshou.data import Collector, CollectStats, VectorReplayBuffer
 from tianshou.env import DummyVectorEnv
-from tianshou.env.venvs import StateSettableWrapper
+from tianshou.env.venvs import StateSettableWrapper, InitialStateStrategy
 from tianshou.trainer import OnPolicyTrainerParams
 from tianshou.utils import TensorboardLogger
 from tianshou.utils.net.common import Net
@@ -44,24 +44,18 @@ ObsType = TypeVar("ObsType")
 ActType = TypeVar("ActType")
 StateType = TypeVar("StateType")
 
+class InitialStateStrategyPendulum(InitialStateStrategy[ObsType, StateType]):
+    def __init__(self, initial_state: StateType) -> None:
+        self.initial_state = initial_state
 
-def create_state_settable_env(
-    env: gym.Env[ObsType, ActType],
-    initial_state: StateType,
-) -> StateSettableWrapper[ObsType, ActType, StateType]:
-    state_attr = "state"
-    state_getter = lambda e: getattr(e.unwrapped, state_attr)
-    state_setter = lambda e, s: setattr(e.unwrapped, state_attr, s)
-    reset_attrs = None
+    def compute_initial_state(self, env: gym.Env) -> StateType:
+        return self.initial_state
 
-    return StateSettableWrapper(
-        env,
-        initial_state,
-        state_attr=state_attr,
-        state_getter=state_getter,
-        state_setter=state_setter,
-        reset_attrs=reset_attrs,
-    )
+    def set_state(self, env: gym.Env, state: StateType) -> None:
+        env.unwrapped.state = state
+
+    def compute_obs_from_state(self, env: gym.Env, state: StateType) -> ObsType:
+        return env.unwrapped._get_obs()
 
 
 def get_args() -> argparse.Namespace:
@@ -121,9 +115,9 @@ def test_grpo(args: argparse.Namespace = get_args(), enable_assertions: bool = T
         )
     train_envs = DummyVectorEnv(
         [
-            lambda initial_state=initial_state: create_state_settable_env(
+            lambda initial_state=initial_state: StateSettableWrapper[np.ndarray, np.ndarray, np.ndarray](
                 gym.make("Pendulum-v1"),
-                initial_state,
+                InitialStateStrategyPendulum(initial_state),
             )
             for initial_state in initial_states_array
         ]

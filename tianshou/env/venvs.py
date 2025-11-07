@@ -38,9 +38,12 @@ class StateSettableEnv(gym.Env[ObsType, ActType], Generic[ObsType, ActType, Stat
         pass
 
     @abstractmethod
-    def get_initial_state(self) -> StateType:
+    def set_state(self, env: gym.Env, state: StateType) -> None:
         pass
 
+    @abstractmethod
+    def get_initial_state(self) -> StateType:
+        pass
 
 class StateSettableWrapper(
     gym.Wrapper[ObsType, ActType, ObsType, ActType],
@@ -50,17 +53,12 @@ class StateSettableWrapper(
     """A wrapper that adds state-setting capabilities to any Gymnasium environment.
 
     This wrapper allows you to:
-    - Set and get the internal state of an environment
+    - Set the internal state of an environment
     - Reset to a specific initial state consistently
-    - Query the initial state
+    - Query the initial observation
 
     Args:
         env: The environment to wrap
-        initial_state: The initial state to reset to
-        state_attr: Name of the state attribute in the wrapped environment (default: "state")
-        state_getter: Custom function to get state from environment
-        state_setter: Custom function to set state on environment
-        reset_attrs: List of attribute names to reset to None when setting state
     """
 
     def __init__(
@@ -92,20 +90,11 @@ class StateSettableWrapper(
         # First call parent reset to initialize the environment properly
         _, info = super().reset(seed=seed)
 
-        # Set the initial state
-        self.set_state(self._initial_state)
+        self._initial_state: StateType = self._initial_state_strategy.compute_initial_state(self.env)
+        self._initial_state_strategy.set_state(self.env, self._initial_state)
+        self._initial_observation: ObsType = self._initial_state_strategy.compute_obs_from_state(self.env, self._initial_state)
 
-        # CRITICAL: Return the OBSERVATION, not the state.
-        # We get this by calling the internal _get_obs() method.
-        obs_new: ObsType
-        if hasattr(self.env.unwrapped, "_get_obs"):
-            obs_new = self.env.unwrapped._get_obs()
-        else:
-            # Fallback for simple envs (like CartPole)
-            # where state == observation
-            obs_new = self.get_state()  # type: ignore
-
-        return obs_new, info
+        return self._initial_observation, info
 
     def set_state(self, state: StateType) -> None:
         """Set the environment state."""

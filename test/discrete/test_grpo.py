@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import TypeVar, Type, Optional, Any
+from typing import TypeVar
 
 from test.determinism_test import AlgorithmDeterminismTest
 
@@ -8,8 +8,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
-from tianshou.env.venvs import StateSettableWrapper
-from gymnasium.envs.classic_control import CartPoleEnv
+from tianshou.env.venvs import InitialStateStrategy, StateSettableWrapper
 from tianshou.algorithm.modelfree.grpo import GRPO
 from tianshou.algorithm.algorithm_base import Algorithm
 from tianshou.algorithm.modelfree.reinforce import DiscreteActorPolicy
@@ -39,24 +38,18 @@ ObsType = TypeVar("ObsType")
 ActType = TypeVar("ActType")
 StateType = TypeVar("StateType")
 
+class InitialStateStrategyCardPole(InitialStateStrategy[ObsType, StateType]):
+    def __init__(self, initial_state: StateType) -> None:
+        self.initial_state = initial_state
 
-def create_state_settable_env(
-    env: gym.Env[ObsType, ActType],
-    initial_state: StateType,
-) -> StateSettableWrapper[ObsType, ActType, StateType]:
-    state_attr = "state"
-    state_getter = lambda e: getattr(e.unwrapped, state_attr)
-    state_setter = lambda e, s: setattr(e.unwrapped, state_attr, s)
-    reset_attrs = None
+    def compute_initial_state(self, env: gym.Env) -> StateType:
+        return self.initial_state
 
-    return StateSettableWrapper(
-        env,
-        initial_state,
-        state_attr=state_attr,
-        state_getter=state_getter,
-        state_setter=state_setter,
-        reset_attrs=reset_attrs,
-    )
+    def set_state(self, env: gym.Env, state: StateType) -> None:
+        env.unwrapped.state = state
+
+    def compute_obs_from_state(self, env: gym.Env, state: StateType) -> ObsType:
+        return np.array(env.unwrapped.state, dtype=np.float32)
 
 
 def get_args() -> argparse.Namespace:
@@ -104,9 +97,9 @@ def test_grpo(args: argparse.Namespace = get_args(), enable_assertions: bool = T
     # Create training environments with fixed initial states for GRPO
     train_envs = DummyVectorEnv(
         [
-            lambda initial_state=initial_state: create_state_settable_env(
+            lambda initial_state=initial_state: StateSettableWrapper[np.ndarray, np.ndarray, np.ndarray](
                 gym.make("CartPole-v1"),
-                initial_state,
+                InitialStateStrategyCardPole(initial_state),
             )
             for initial_state in initial_states_array
         ]
