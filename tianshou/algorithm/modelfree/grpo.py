@@ -1,9 +1,10 @@
 import hashlib
 from dataclasses import dataclass
+from typing import TypeVar, cast
 
 import numpy as np
 import torch
-from typing import cast, TypeVar
+
 from tianshou.algorithm.algorithm_base import OnPolicyAlgorithm, TrainingStats
 from tianshou.algorithm.modelfree.reinforce import ProbabilisticActorPolicy
 from tianshou.algorithm.optim import OptimizerFactory
@@ -26,10 +27,10 @@ class GRPOTrainingStats(TrainingStats):
 
 def _get_episode_start_indices(batch: BatchT) -> np.ndarray:
     """Get indices where new episodes start using done flags."""
-    # First timestep is always a episode start
+    # First timestep is always an episode start
     is_start = np.zeros(len(batch), dtype=bool)
     is_start[0] = True
-    # Timestep after a done is a episode start
+    # Timestep after a done is an episode start
     if len(batch) > 1:
         is_start[1:] = batch.done[:-1]
     return np.where(is_start)[0]
@@ -61,11 +62,23 @@ def filter_by_initial_state(
     matching_episode_ids = []
     for i, start_idx in enumerate(start_indices):
         state = first_timesteps.obs[i]
-        if numpy_hash_rounded(state) == state_hash:
+        state_arr = np.asarray(state) if not isinstance(state, np.ndarray) else state
+        if numpy_hash_rounded(state_arr) == state_hash:
             matching_episode_ids.append(batch.episode_id[start_idx])
 
     mask = np.isin(batch.episode_id, matching_episode_ids)
     return batch[mask]
+
+
+def extract_episode_boundaries(batch: RolloutBatchProtocol) -> tuple[np.ndarray, np.ndarray]:
+    """Extract start and end indices for each episode in the batch.
+    Returns:
+        start_indices: Array of shape (num_episodes,) starting indices for each episode
+        end_indices: Array of shape (num_episodes,) ending indices for each episode
+    """
+    end_indices = np.where(batch.done)[0]
+    start_indices: np.ndarray = np.concatenate((np.array([0]), end_indices[:-1] + 1))
+    return start_indices, end_indices
 
 
 def numpy_hash_rounded(arr: np.ndarray, decimals: int = 6, algorithm: str = "sha1") -> str:
@@ -96,21 +109,9 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
         self.max_batchsize = max_batchsize
         self.kl_coefficient = kl_coefficient
 
-    def _extract_episode_boundaries(
-        self, batch: RolloutBatchProtocol
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Extract start and end indices for each episode in the batch.
-
-        Returns:
-            start_indices: Array of shape (num_episodes,) starting indices for each episode
-            end_indices: Array of shape (num_episodes,) ending indices for each episode
-        """
-        end_indices = np.where(batch.done)[0]
-        start_indices = np.concatenate(([0], end_indices[:-1] + 1))
-        return start_indices, end_indices
-
+    @staticmethod
     def _compute_episode_returns(
-        self, batch: RolloutBatchProtocol, start_indices: np.ndarray, end_indices: np.ndarray
+        batch: RolloutBatchProtocol, start_indices: np.ndarray, end_indices: np.ndarray
     ) -> np.ndarray:
         """Compute total return for each episode.
 
@@ -136,7 +137,7 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
     ) -> GrpoBatchProtocol:
         """Preprocess batch by computing advantages using GRPO algorithm."""
         # Step 1: Extract episode boundaries
-        start_indices, end_indices = self._extract_episode_boundaries(batch)
+        start_indices, end_indices = extract_episode_boundaries(batch)
         num_episodes = len(start_indices)
         last_done_idx = end_indices[-1]
 
@@ -146,11 +147,14 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
 
         # Step 2: Pre-allocate metadata arrays (compute once)
         batch.episode_id = np.zeros(len(batch), dtype=np.int64)
-        batch.initial_state = np.empty((len(batch),) + batch.obs.shape[1:], dtype=batch.obs.dtype)
+        batch.initial_state = np.empty(
+            (len(batch),) + tuple(batch.obs.shape[1:]),
+            dtype=batch.obs.dtype,  # type: ignore[arg-type]
+        )
         batch.adv = np.zeros(len(batch), dtype=np.float64)
 
         # Step 3: Extract starting states and compute hashes ONCE
-        starting_states = np.round(batch[start_indices].obs, decimals=6)
+        starting_states = np.round(np.asarray(batch[start_indices].obs), decimals=6)
         state_hashes = np.array([numpy_hash_rounded(state) for state in starting_states])
         unique_hashes, inverse_indices = np.unique(state_hashes, return_inverse=True)
 
@@ -198,22 +202,25 @@ class GRPO(OnPolicyAlgorithm[ProbabilisticActorPolicy]):
 
     def _update_with_batch(
         self,
-        batch: GrpoBatchProtocol,
+        batch: RolloutBatchProtocol,
         batch_size: int | None,
         repeat: int,
     ) -> TrainingStats:
         """Update policy by iterating over initial states."""
+        # Cast to GrpoBatchProtocol since _preprocess_batch returns it
+        grpo_batch = cast(GrpoBatchProtocol, batch)
+
         losses, clip_losses, kl_losses = [], [], []
         gradient_steps = 0
         split_batch_size = batch_size or self.max_batchsize
 
         # Get unique initial states
-        unique_states = get_unique_initial_states(batch)
+        unique_states = get_unique_initial_states(grpo_batch)
 
         # Iterate over each unique initial state
         for state_hash in unique_states.keys():
             # Filter to get all timesteps from episodes with this initial state
-            state_batch = filter_by_initial_state(batch, state_hash)
+            state_batch = filter_by_initial_state(grpo_batch, state_hash)
 
             # Split and process minibatches
             for minibatch in state_batch.split(split_batch_size, shuffle=False, merge_last=True):

@@ -16,6 +16,7 @@ from tianshou.algorithm.modelfree.fqf import FQF
 from tianshou.algorithm.modelfree.a2c import A2C
 from tianshou.algorithm.modelfree.npg import NPG
 from tianshou.algorithm.modelfree.ppo import PPO
+from tianshou.algorithm.modelfree.grpo import GRPO
 from tianshou.algorithm.modelfree.trpo import TRPO
 from tianshou.algorithm.modelfree.td3 import TD3
 from tianshou.algorithm.modelfree.sac import SAC

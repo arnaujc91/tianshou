@@ -11,16 +11,6 @@ TObs = TObsArr | BatchProtocol
 TNestedDictValue = np.ndarray | dict[str, "TNestedDictValue"]
 
 
-class GrpoBatchProtocol(BatchProtocol, Protocol):
-    """Batch with trajectory tracking for GRPO."""
-
-    initial_state: np.ndarray  # Starting state for each timestep
-    episode_id: np.ndarray  # Unique ID for each trajectory given the initial state
-    state_hash: np.ndarray
-    adv: np.ndarray  # Advantages computed by GRPO
-    logp_old: torch.Tensor
-
-
 class ObsBatchProtocol(BatchProtocol, Protocol):
     """Observations of an environment that a policy can turn into actions.
 
@@ -44,6 +34,16 @@ class RolloutBatchProtocol(ObsBatchProtocol, Protocol):
     rew: np.ndarray
     terminated: TArr
     truncated: TArr
+
+
+class GrpoBatchProtocol(RolloutBatchProtocol, Protocol):
+    """Batch with trajectory tracking for GRPO."""
+
+    initial_state: np.ndarray  # Starting state for each timestep
+    episode_id: np.ndarray  # Unique ID for each trajectory given the initial state
+    state_hash: np.ndarray
+    adv: np.ndarray  # Advantages computed by GRPO
+    logp_old: torch.Tensor
 
 
 class BatchWithReturnsProtocol(RolloutBatchProtocol, Protocol):
