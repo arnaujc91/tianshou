@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from typing import Any, Literal, TypeVar, Generic, Optional
+from typing import Any, Literal, TypeVar, Generic
 
 import gymnasium as gym
 import numpy as np

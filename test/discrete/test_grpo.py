@@ -38,6 +38,7 @@ ObsType = TypeVar("ObsType")
 ActType = TypeVar("ActType")
 StateType = TypeVar("StateType")
 
+
 class InitialStateStrategyCardPole(InitialStateStrategy[ObsType, StateType]):
     def __init__(self, initial_state: StateType) -> None:
         self.initial_state = initial_state
@@ -97,7 +98,9 @@ def test_grpo(args: argparse.Namespace = get_args(), enable_assertions: bool = T
     # Create training environments with fixed initial states for GRPO
     train_envs = DummyVectorEnv(
         [
-            lambda initial_state=initial_state: StateSettableWrapper[np.ndarray, np.ndarray, np.ndarray](
+            lambda initial_state=initial_state: StateSettableWrapper[
+                np.ndarray, np.ndarray, np.ndarray
+            ](
                 gym.make("CartPole-v1"),
                 InitialStateStrategyCardPole(initial_state),
             )
